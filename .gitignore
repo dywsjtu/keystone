@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Packaging / installed editable
+src/*.egg-info/
+
+# Testing / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local experiment artifacts (not part of the library)
+results/
+results-*/
+*.log

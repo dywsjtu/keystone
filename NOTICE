@@ -1,0 +1,20 @@
+KeyStone — Geometry Guided Self-Consistency for Physical AI
+Copyright 2026 The KeyStone Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+------------------------------------------------------------------------
+
+This project's selector was developed and evaluated alongside forks of the
+following Apache-2.0 projects. The portable templates under examples/ mirror
+the integrations used there:
+
+  * LeRobot — https://github.com/huggingface/lerobot
+    Copyright The HuggingFace Team. Apache License 2.0.
+
+  * vla-evaluation-harness — https://github.com/allenai/vla-evaluation-harness
+    Copyright Allen Institute for AI. Apache License 2.0.
