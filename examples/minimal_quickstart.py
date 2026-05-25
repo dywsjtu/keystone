@@ -31,37 +31,39 @@ def main() -> None:
     K, T, D = 16, 50, 7
     candidates = fake_policy_samples(K, T, D)  # (K, T, D)
 
-    # Keystone selector: cluster in action space, return the largest cluster's
-    # medoid -- one real chunk. Fixed C=2 clusters:
-    chosen = cluster_medoid_select(candidates, num_clusters=2)  # (T, D)
+    # KeyStone selector (the paper's guarded cluster-medoid rule, Listing 2): the
+    # unimodality guard sees a clear bimodal split here, so it runs k-means and
+    # returns the medoid of the dominant mode -- one real sampled chunk.
+    chosen = cluster_medoid_select(candidates)  # (T, D)
+    chosen_idx = next(k for k in range(K) if (candidates[k] - chosen).abs().max() < 1e-6)
 
-    # ...or let the cluster count be detected automatically (with a unimodality
-    # fall-back to the global medoid):
-    chosen_auto = cluster_medoid_select(candidates, auto=True)  # (T, D)
-
-    # The chosen chunk is exactly one of the sampled candidates ...
-    matches = [(candidates[k] - chosen).abs().max().item() < 1e-6 for k in range(K)]
-    chosen_idx = matches.index(True)
-    auto_idx = next(k for k in range(K) if (candidates[k] - chosen_auto).abs().max() < 1e-6)
-
-    # ... whereas the mean is a synthetic chunk far from every candidate.
+    # ... whereas the mean is a synthetic chunk far from every candidate
+    # (it interpolates the two modes, landing off the action manifold).
     mean_chunk = candidates.mean(dim=0)
     mean_min_dist = min((candidates[k] - mean_chunk).norm().item() for k in range(K))
-    chosen_to_others = candidates.sub(chosen).flatten(1).norm(dim=1).mean().item()
 
     print(f"K={K} candidates, chunk shape (T={T}, D={D})")
-    print(f"cluster_medoid       -> candidate #{chosen_idx} (a real sampled chunk)")
-    print(f"cluster_medoid_auto  -> candidate #{auto_idx} (a real sampled chunk)")
-    print(f"  mean distance from chosen chunk to all candidates: {chosen_to_others:.2f}")
+    print(f"cluster_medoid_guarded -> candidate #{chosen_idx} (real chunk, dominant mode)")
     print(f"  min distance from the *mean* chunk to any candidate: {mean_min_dist:.2f}  "
           f"(off-manifold: interpolates the two modes)")
 
+    # On a (near-)unimodal cloud the guard skips clustering and returns the global
+    # medoid -- the same rule, its other branch.
+    g = torch.Generator().manual_seed(7)
+    center = torch.randn(T, D, generator=g)
+    unimodal = torch.stack([center + 0.02 * torch.randn(T, D, generator=g) for _ in range(K)])
+    flat = unimodal.flatten(1)
+    global_medoid_idx = int(torch.cdist(flat, flat).sum(dim=-1).argmin())
+    guarded_unimodal = cluster_medoid_select(unimodal)
+    same = (unimodal[global_medoid_idx] - guarded_unimodal).abs().max() < 1e-6
+    print(f"unimodal cloud         -> guard returns the global medoid (#{global_medoid_idx}): {bool(same)}")
+
     # The lower-level config API adds the padding-aware action_dim, batched
     # (K, B, T, D) inputs, and executed_steps.
-    cfg = SelfConsistencyConfig(num_samples=K, aggregation="cluster_medoid", distance="l2")
-    batched = candidates.unsqueeze(1)                         # (K, B=1, T, D)
+    cfg = SelfConsistencyConfig(num_samples=K, aggregation="cluster_medoid_guarded", distance="l2")
+    batched = candidates.unsqueeze(1)                          # (K, B=1, T, D)
     chunk = aggregate_actions(batched, cfg, executed_steps=10)  # (B=1, 10, D)
-    print(f"\naggregate_actions(cluster_medoid, executed_steps=10) -> {tuple(chunk.shape)}")
+    print(f"\naggregate_actions(cluster_medoid_guarded, executed_steps=10) -> {tuple(chunk.shape)}")
 
 
 if __name__ == "__main__":

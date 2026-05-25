@@ -11,7 +11,7 @@ selector itself is imported from this `keystone` package.
 | Model | `--policy.path` | `n_action_steps` | Selector in the paper |
 |---|---|---|---|
 | SmolVLA | `HuggingFaceVLA/smolvla_libero` | 25 | `cluster_medoid`, K=16 |
-| π0.5 | `lerobot/pi05_libero_finetuned` | 50 | `cluster_medoid_auto`, K=16 |
+| π0.5 | `lerobot/pi05_libero_finetuned` | 50 | `cluster_medoid_guarded`, K=16 |
 
 ## Setup
 
@@ -35,7 +35,7 @@ The fork ships ready-made scripts that sweep the four LIBERO suites:
 
 ```bash
 bash scripts/run_libero_smolvla.sh   # SmolVLA, K=16 cluster_medoid
-bash scripts/run_libero_pi05.sh      # π0.5,   K=16 cluster_medoid_auto
+bash scripts/run_libero_pi05.sh      # π0.5,   K=16 cluster_medoid_guarded
 ```
 
 Each invokes `lerobot-eval`. The self-consistency knobs are just policy flags,
@@ -70,7 +70,7 @@ Relevant flags:
 | Flag | Meaning |
 |---|---|
 | `--policy.self_consistency.num_samples` | K, candidate chunks per round. |
-| `--policy.self_consistency.aggregation` | `medoid`, `cluster_medoid`, or `cluster_medoid_auto`. |
+| `--policy.self_consistency.aggregation` | `cluster_medoid_guarded` (default), `medoid`, or `cluster_medoid`. |
 | `--policy.n_action_steps` | Executed steps before the next replan (selection runs over these). |
 
 ## Parse results

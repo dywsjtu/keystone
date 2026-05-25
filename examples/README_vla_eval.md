@@ -37,9 +37,14 @@ mechanics — follow the upstream README:
 https://github.com/allenai/vla-evaluation-harness. The steps below are the
 KeyStone-specific additions on top of that.
 
-GR00T / StarVLA need their upstream caches under `~/.cache/vla-eval/` patched for
-K-noise sampling; each server reapplies the one-line noise-tiling patch
-automatically on load (`_install_k_noise_patch`).
+No upstream model code is edited for K-noise sampling. When a server loads its
+model it calls `_install_k_noise_patch`, an **in-process** monkey-patch (nothing
+on disk changes) that wraps the model's action-prediction method: it expands the
+encoded prefix/features K-fold along the batch dim with `repeat_interleave`, runs
+the upstream denoising loop at batch size K·B — which already draws independent
+noise per row, so one VLM forward yields K genuinely different candidates — then
+reshapes the `(K·B, T, D)` output to `(K, B, T, D)` and reduces it to one chunk
+via `aggregate_actions`.
 
 ## How K is configured
 
@@ -52,7 +57,7 @@ extends: simpler_google_robot.yaml
 args:
   self_consistency:
     num_samples: 16             # K
-    aggregation: "cluster_medoid"   # or medoid / cluster_medoid_auto
+    aggregation: "cluster_medoid"   # or cluster_medoid_guarded / medoid
     cluster_medoid_num_clusters: 2
     distance: "l2"
 ```

@@ -11,8 +11,8 @@ from keystone import (
 )
 from keystone.selection import _pairwise_distances
 
-METHODS = ["medoid", "cluster_medoid", "cluster_medoid_auto"]
-REMOVED_METHODS = ["mean", "median", "mode", "plurality", "smoothness", "auto"]
+METHODS = ["cluster_medoid_guarded", "medoid", "cluster_medoid"]
+REMOVED_METHODS = ["mean", "median", "mode", "plurality", "smoothness", "auto", "cluster_medoid_auto"]
 
 
 def _is_one_of(chunk: torch.Tensor, candidates: torch.Tensor) -> bool:
@@ -55,8 +55,8 @@ def test_executed_steps_truncates():
     assert out.shape == (B, 10, D)
 
 
-def test_auto_unimodality_fallback_to_global_medoid():
-    """A tight unimodal cloud: cluster_medoid_auto must return the global medoid."""
+def test_guarded_unimodality_returns_global_medoid():
+    """A tight unimodal cloud: cluster_medoid_guarded must return the global medoid."""
     K, T, D = 16, 30, 7
     g = torch.Generator().manual_seed(0)
     center = torch.randn(T, D, generator=g)
@@ -65,12 +65,12 @@ def test_auto_unimodality_fallback_to_global_medoid():
     dists = _pairwise_distances(candidates.unsqueeze(1), "l2")[0]  # (K, K)
     global_medoid_idx = int(dists.sum(dim=-1).argmin().item())
 
-    out = cluster_medoid_select(candidates, auto=True)
+    out = cluster_medoid_select(candidates)  # guarded, default tau
     assert torch.allclose(out, candidates[global_medoid_idx], atol=1e-6)
 
 
-@pytest.mark.parametrize("auto", [False, True])
-def test_bimodal_selects_dominant_mode(auto):
+@pytest.mark.parametrize("guarded", [False, True])
+def test_bimodal_selects_dominant_mode(guarded):
     """70/30 bimodal cloud: the chosen chunk must come from the larger mode."""
     K, T, D = 20, 30, 7
     g = torch.Generator().manual_seed(1)
@@ -84,9 +84,13 @@ def test_bimodal_selects_dominant_mode(auto):
         in_a.append(is_a)
     candidates = torch.stack(cands)
 
-    out = cluster_medoid_select(candidates, num_clusters=2, auto=auto)
+    if guarded:
+        out = cluster_medoid_select(candidates, C=2)
+    else:
+        cfg = SelfConsistencyConfig(num_samples=K, aggregation="cluster_medoid", cluster_medoid_num_clusters=2)
+        out = aggregate_actions(candidates.unsqueeze(1), cfg)[0]
     chosen_idx = next(k for k in range(K) if (candidates[k] - out).abs().max() < 1e-6)
-    assert in_a[chosen_idx], f"(auto={auto}) selected a chunk from the minority mode"
+    assert in_a[chosen_idx], f"(guarded={guarded}) selected a chunk from the minority mode"
 
 
 @pytest.mark.parametrize("metric", ["l1", "l2", "cosine"])
@@ -128,10 +132,10 @@ def test_select_chunk_unbatched_and_batched():
     assert select_chunk(torch.randn(K, 4, T, D), cfg).shape == (4, T, D)
 
 
-def test_cluster_medoid_select_auto_flag_shape():
+def test_cluster_medoid_select_guarded_shape():
     K, T, D = 12, 30, 7
     candidates = torch.randn(K, T, D)
-    out = cluster_medoid_select(candidates, auto=True)
+    out = cluster_medoid_select(candidates)
     assert out.shape == (T, D)
     assert _is_one_of(out, candidates)
 
@@ -140,7 +144,6 @@ def test_k_equals_one_is_identity():
     T, D = 30, 7
     candidates = torch.randn(1, T, D)
     assert torch.allclose(cluster_medoid_select(candidates), candidates[0], atol=1e-6)
-    assert torch.allclose(cluster_medoid_select(candidates, auto=True), candidates[0], atol=1e-6)
 
 
 def test_unknown_method_raises():
@@ -153,6 +156,3 @@ def test_determinism():
     K, T, D = 12, 30, 7
     candidates = torch.randn(K, T, D)
     assert torch.equal(cluster_medoid_select(candidates), cluster_medoid_select(candidates))
-    assert torch.equal(
-        cluster_medoid_select(candidates, auto=True), cluster_medoid_select(candidates, auto=True)
-    )

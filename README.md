@@ -44,7 +44,8 @@ from keystone import cluster_medoid_select
 # K candidate action chunks, e.g. drawn from K independent noises.
 candidates = torch.randn(16, 50, 7)        # (K, T, action_dim)
 
-# Returns ONE real chunk — the medoid of the dominant mode.
+# Returns ONE real chunk via the paper's guarded cluster-medoid rule
+# (global medoid if unimodal, else the dominant cluster's medoid).
 chunk = cluster_medoid_select(candidates)  # (T, action_dim)
 ```
 
@@ -58,8 +59,8 @@ python examples/minimal_quickstart.py
 
 | Symbol | Purpose |
 |---|---|
-| `cluster_medoid_select(candidates, num_clusters=2, distance="l2", auto=False, ...)` | Convenience selector. Returns one real chunk. Accepts `(K, T, D)` or `(K, B, T, D)`. Pass `auto=True` for the auto cluster-count variant. |
-| `SelfConsistencyConfig` | All knobs: `num_samples` (K), `aggregation`, `cluster_medoid_num_clusters` (C), `cluster_medoid_auto_min_gap`, `distance`, `action_dim`. |
+| `cluster_medoid_select(candidates, C=2, tau=0.3, distance="l2", ...)` | KeyStone's selector — the paper's `cluster_medoid_select` (Listing 2). Returns one real chunk. Accepts `(K, T, D)` or `(K, B, T, D)`. |
+| `SelfConsistencyConfig` | All knobs: `num_samples` (K), `aggregation`, `cluster_medoid_num_clusters` (C), `unimodal_tau` (τ), `distance`, `action_dim`. |
 | `aggregate_actions(actions, config, executed_steps=None)` | Lower-level engine over `(K, B, T, D)`. |
 | `select_chunk(candidates, config, ...)` | Like `aggregate_actions` but also accepts unbatched `(K, T, D)`. |
 | `expand_kv_cache(kv, K)`, `repeat_batch(t, K)` | Latency-preserving K-batch expansion of a transformer KV cache / prefix tensors. |
@@ -67,14 +68,14 @@ python examples/minimal_quickstart.py
 
 ### Selection methods
 
-Both return a **real** sampled chunk (the medoid of the dominant cluster) — never
-a synthesized average that could land off the model's action manifold.
+All return a **real** sampled chunk — never a synthesized average that could land
+off the model's action manifold.
 
 | `aggregation` | Notes |
 |---|---|
-| `medoid` | The global medoid — the chunk minimizing total distance to all others (vector generalization of the median). No clustering. |
-| `cluster_medoid` *(default)* | k-means with a fixed cluster count C (`cluster_medoid_num_clusters`, default 2); return the medoid of the largest cluster. |
-| `cluster_medoid_auto` | Cluster count detected automatically via a single-linkage largest-gap cut; falls back to the global medoid when the candidates look unimodal (`cluster_medoid_auto_min_gap`). |
+| `cluster_medoid_guarded` *(default)* | The paper's method (Listing 2). A unimodality guard returns the global medoid when the sample mean lies close to it (`spread = ‖mean − medoid‖ / median_pairwise < unimodal_tau`, default τ=0.3); otherwise it runs k-means (C clusters) and returns the largest cluster's medoid. |
+| `medoid` | The global medoid alone — the chunk minimizing total distance to all others (vector generalization of the median). No clustering (the guard's unimodal branch). |
+| `cluster_medoid` | k-means with a fixed cluster count C (`cluster_medoid_num_clusters`, default 2); return the medoid of the largest cluster. No guard (the guard's multimodal branch). |
 
 `distance` ∈ `{l1, l2, cosine}`. Set `action_dim` to ignore zero-padding beyond
 the real action dimensions. Pass `executed_steps` to select over only the
@@ -89,12 +90,14 @@ timesteps that actually run before the next replan.
 ```
 
 The selector flattens each candidate chunk and computes one `K×K` pairwise
-distance matrix. `cluster_medoid` runs k-means with a fixed cluster count, takes
-the largest cluster, and returns its medoid (the within-cluster chunk closest to
-the others). `cluster_medoid_auto` instead infers the cluster count from the
-largest gap in the sorted pairwise distances, and returns the global medoid when
-no clear structure exists. Every step is a batched on-GPU tensor op over only K
-compact chunks (≤ a few hundred µs at K≤16).
+distance matrix. `cluster_medoid_guarded` (the default) first runs the
+unimodality guard — it compares the sample mean to the global medoid, normalized
+by the median pairwise distance; if they nearly agree it returns the global
+medoid, otherwise it runs k-means (fixed cluster count C), takes the largest
+cluster, and returns its medoid (the within-cluster chunk closest to the others).
+The `medoid` and `cluster_medoid` methods expose those two branches on their own.
+Every step is a batched on-GPU tensor op over only K compact chunks (≤ a few
+hundred µs at K≤16).
 
 ## Adding KeyStone to your policy
 

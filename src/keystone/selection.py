@@ -10,14 +10,18 @@ dense region is a natural model-free notion of consensus.
 Three selectors are provided, all returning a *real* sampled chunk (never an
 interpolation between modes):
 
-- ``medoid``: the global medoid -- the chunk minimizing total distance to all
-  others (the vector generalization of the median).
+- ``cluster_medoid_guarded`` *(the paper's method, Listing 2)*: a unimodality
+  guard first decides whether clustering is warranted -- if the sample mean lies
+  close to the global medoid relative to the median pairwise distance
+  (``spread = ||mean - medoid|| / (median dist + eps)``, below ``tau``) the
+  global medoid is returned; otherwise k-means is run and the largest cluster's
+  medoid is returned.
+- ``medoid``: the global medoid alone -- the chunk minimizing total distance to
+  all others (the vector generalization of the median).
 - ``cluster_medoid``: k-means with a fixed number of clusters C; return the
-  medoid of the largest cluster.
-- ``cluster_medoid_auto``: cluster count detected automatically, with a
-  fall-back to the global medoid when the candidates look unimodal.
+  medoid of the largest cluster (no guard).
 
-Both are batched on-GPU tensor ops over only K compact chunks and reuse a single
+All are batched on-GPU tensor ops over only K compact chunks and reuse a single
 K x K pairwise distance matrix; the entire selection adds at most a few hundred
 microseconds per round at the K values used in the paper (<= 16).
 """
@@ -55,20 +59,21 @@ def aggregate_actions(
         actions = actions[:, :, :executed_steps, :]
 
     ad = config.action_dim
-    if config.aggregation == "medoid":
+    if config.aggregation == "cluster_medoid_guarded":
+        return _cluster_medoid_guarded_aggregation(
+            actions, config.distance, ad,
+            config.cluster_medoid_num_clusters, config.unimodal_tau,
+        )
+    elif config.aggregation == "medoid":
         return _medoid_aggregation(actions, config.distance, ad)
     elif config.aggregation == "cluster_medoid":
         return _cluster_medoid_aggregation(
             actions, config.distance, ad, config.cluster_medoid_num_clusters,
         )
-    elif config.aggregation == "cluster_medoid_auto":
-        return _cluster_medoid_auto_aggregation(
-            actions, config.distance, ad, config.cluster_medoid_auto_min_gap,
-        )
     else:
         raise ValueError(
             f"Unknown aggregation method: {config.aggregation!r} "
-            "(expected 'medoid', 'cluster_medoid', or 'cluster_medoid_auto')"
+            "(expected 'cluster_medoid_guarded', 'medoid', or 'cluster_medoid')"
         )
 
 
@@ -160,77 +165,61 @@ def _cluster_medoid_aggregation(
     return actions[winners, batch_indices]
 
 
-def _single_linkage_auto_clusters(dists: Tensor, min_relative_gap: float) -> Tensor:
-    """Single-linkage clustering with an automatic cut at the largest distance gap.
-
-    Sort the unique pairwise distances, cut at the largest consecutive gap, and
-    union endpoints of every edge below the cut. Falls back to a single cluster
-    when the largest gap is small relative to the median distance (no clear
-    structure). Cost ~O(K^2 log K) per batch element; no sweep over K.
-
-    Returns:
-        (K,) long tensor of densely-relabeled cluster ids.
-    """
-    K = dists.shape[0]
-    if K <= 2:
-        return torch.zeros(K, dtype=torch.long, device=dists.device)
-
-    iu, ju = torch.triu_indices(K, K, offset=1, device=dists.device)
-    edges = dists[iu, ju]
-    sorted_edges, order = edges.sort()
-    gaps = sorted_edges[1:] - sorted_edges[:-1]
-    cut_idx = int(gaps.argmax().item())
-    median_dist = sorted_edges.median()
-
-    if gaps[cut_idx].item() < min_relative_gap * (median_dist.item() + 1e-8):
-        return torch.zeros(K, dtype=torch.long, device=dists.device)
-
-    parent = list(range(K))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    iu_l, ju_l, order_l = iu.tolist(), ju.tolist(), order.tolist()
-    for rank in range(cut_idx + 1):
-        e_idx = order_l[rank]
-        i, j = iu_l[e_idx], ju_l[e_idx]
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[ri] = rj
-
-    roots = torch.tensor([find(i) for i in range(K)], device=dists.device, dtype=torch.long)
-    _, assigns = torch.unique(roots, return_inverse=True)
-    return assigns
-
-
-def _cluster_medoid_auto_aggregation(
+def _cluster_medoid_guarded_aggregation(
     actions: Tensor,
     metric: str = "l2",
     action_dim: int | None = None,
-    min_relative_gap: float = 0.3,
+    num_clusters: int = 2,
+    tau: float = 0.3,
 ) -> Tensor:
-    """Like cluster_medoid, but the number of clusters is auto-detected.
+    """The paper's guarded selector (Listing 2): a per-batch switch between the
+    global medoid and cluster-medoid based on a unimodality check.
 
-    Returns the medoid of the largest auto-detected cluster; when no clear
-    cluster structure exists, returns the global medoid.
+    Multimodality is detected from the gap between the sample mean and the
+    medoid, normalized by the typical pairwise spread:
+
+        spread = ||mean(samples) - medoid(samples)|| / median_pairwise_distance
+
+    Unimodal cloud -> mean ~= medoid -> spread ~= 0 -> use the global medoid
+    (all K samples, for stability). Multimodal cloud -> the mean falls between
+    modes while the medoid sits inside one -> spread is large -> use
+    cluster_medoid (commit to the dominant mode). ``spread > tau`` triggers
+    clustering.
+
+    Returns:
+        (B, T, D) -- chosen real chunk per batch element.
     """
     K, B, T, D = actions.shape
+    if K == 1:
+        return actions[0]
+
+    ad = action_dim or D
+    flat = actions[:, :, :, :ad].reshape(K, B, T * ad).permute(1, 0, 2)  # (B, K, T*ad)
     dists = _pairwise_distances(actions, metric, action_dim)  # (B, K, K)
 
-    winners = torch.empty(B, dtype=torch.long, device=actions.device)
-    for b in range(B):
-        assigns = _single_linkage_auto_clusters(dists[b], min_relative_gap)
-        num_found = int(assigns.max().item()) + 1
-        counts = torch.bincount(assigns, minlength=num_found)
+    medoid_idx = dists.sum(dim=-1).argmin(dim=-1)  # (B,)
+    batch_indices = torch.arange(B, device=actions.device)
+
+    # Spread heuristic uses L2 in flattened-trajectory space regardless of
+    # `metric`, so the threshold is interpretable across distance choices.
+    mean_flat = flat.mean(dim=1)  # (B, T*ad)
+    medoid_flat = flat[batch_indices, medoid_idx]  # (B, T*ad)
+    gap = (mean_flat - medoid_flat).norm(dim=-1)  # (B,)
+
+    iu, ju = torch.triu_indices(K, K, offset=1, device=actions.device)
+    median_dist = dists[:, iu, ju].median(dim=-1).values  # (B,)
+    spread = gap / (median_dist + 1e-8)
+    use_cluster = spread > tau  # (B,)
+
+    winners = medoid_idx.clone()
+    for b in use_cluster.nonzero(as_tuple=True)[0].tolist():
+        assigns = _kmeans_assignments(flat[b], num_clusters)
+        counts = torch.bincount(assigns, minlength=num_clusters)
         members = (assigns == int(counts.argmax().item())).nonzero(as_tuple=True)[0]
         sub = dists[b].index_select(0, members).index_select(1, members)
         winners[b] = members[sub.sum(dim=-1).argmin()]
 
-    batch_indices = torch.arange(B, device=actions.device)
-    return actions[winners, batch_indices]
+    return actions[winners, batch_indices]  # (B, T, D)
 
 
 def select_chunk(
@@ -253,48 +242,40 @@ def select_chunk(
 
 def cluster_medoid_select(
     candidates: Tensor,
-    num_clusters: int = 2,
+    C: int = 2,
+    tau: float = 0.3,
     distance: str = "l2",
     action_dim: int | None = None,
     executed_steps: int | None = None,
-    auto: bool = False,
-    auto_min_gap: float = 0.3,
 ) -> Tensor:
-    """Keystone's cluster-medoid selector -- convenience entry point.
+    """KeyStone's selector -- the paper's ``cluster_medoid_select`` (Listing 2).
 
-    Clusters the K candidate chunks in action space and returns the medoid of
-    the largest cluster (a real sampled chunk).
+    Runs the unimodality-guarded cluster-medoid rule over K candidate chunks and
+    returns a single real sampled chunk: the global medoid when the candidates
+    look unimodal (sample mean close to the medoid relative to the median
+    pairwise distance, ``spread < tau``), otherwise the medoid of the largest of
+    ``C`` k-means clusters.
 
     Args:
         candidates: ``(K, T, D)`` or ``(K, B, T, D)`` sampled action chunks.
-        num_clusters: C, number of k-means clusters (default 2). Ignored when
-            ``auto=True``.
+        C: number of k-means clusters used when the guard triggers clustering
+            (default 2).
+        tau: unimodality-guard threshold (default 0.3); below this the global
+            medoid is returned with no clustering.
         distance: 'l1', 'l2', or 'cosine'.
         action_dim: real action dims before padding (None = use all D).
         executed_steps: truncate the chunk to its first ``executed_steps``
             timesteps before selection (the steps that actually run).
-        auto: if True, use ``cluster_medoid_auto`` (auto cluster-count detection
-            with a unimodality fall-back to the global medoid) instead of
-            fixed-C ``cluster_medoid``.
-        auto_min_gap: unimodality threshold used only when ``auto=True``.
 
     Returns:
         ``(T, D)`` or ``(B, T, D)`` -- a single selected real chunk.
     """
-    if auto:
-        config = SelfConsistencyConfig(
-            num_samples=candidates.shape[0],
-            aggregation="cluster_medoid_auto",
-            cluster_medoid_auto_min_gap=auto_min_gap,
-            distance=distance,
-            action_dim=action_dim,
-        )
-    else:
-        config = SelfConsistencyConfig(
-            num_samples=candidates.shape[0],
-            aggregation="cluster_medoid",
-            cluster_medoid_num_clusters=num_clusters,
-            distance=distance,
-            action_dim=action_dim,
-        )
+    config = SelfConsistencyConfig(
+        num_samples=candidates.shape[0],
+        aggregation="cluster_medoid_guarded",
+        cluster_medoid_num_clusters=C,
+        unimodal_tau=tau,
+        distance=distance,
+        action_dim=action_dim,
+    )
     return select_chunk(candidates, config, executed_steps)

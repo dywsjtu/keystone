@@ -52,7 +52,8 @@ class KeystonePolicy:
     Args:
         base_policy: a policy implementing the :class:`SamplablePolicy` protocol.
         config: Keystone configuration (K, aggregation method, etc.). If omitted,
-            uses the paper defaults (``auto`` selection, K from ``num_samples``).
+            uses the paper defaults (``cluster_medoid_guarded`` selection, K from
+            ``num_samples``).
         executed_steps: optional chunk truncation before selection (the policy's
             ``n_action_steps``).
     """
